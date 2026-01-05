@@ -1,0 +1,35 @@
+# Environment variables
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Project specific
+outputs/
+logs/
+data/raw/
+data/processed/
+# We keep train.jsonl tracked if small, otherwise ignore
+# data/train.jsonl
+
+# Weights and Biases
+wandb/
