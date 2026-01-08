@@ -144,7 +144,7 @@ def run_inference_mlx(model_path: str, messages: list) -> str:
             logger.info(f"Applying LoRA adapter from: {model_path}")
             
             # Load base model with adapter
-            model, tokenizer = load(base_model, adapter_path=str(model_path))
+            model, tokenizer = load(base_model, adapter_path=str(model_path,))
         else:
             # Load merged model directly
             logger.info(f"Loading merged model: {model_path}")
@@ -161,8 +161,6 @@ def run_inference_mlx(model_path: str, messages: list) -> str:
             model, 
             tokenizer, 
             prompt=prompt,
-            max_tokens=512,
-            temp=0.1
         )
         return response
     except ImportError:
@@ -195,7 +193,7 @@ def run_inference_unsloth(model_path: str, messages: list) -> str:
         outputs = model.generate(
             input_ids=inputs,
             max_new_tokens=512,
-            temperature=0.1,
+            # temperature=0.1,
         )
         
         response = tokenizer.decode(outputs[0][inputs.shape[1]:], skip_special_tokens=True)
