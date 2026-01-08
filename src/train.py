@@ -367,6 +367,7 @@ def main():
     parser.add_argument("--max-chunk-tokens", type=int, default=MAX_TRAIN_TOKENS, 
                         help="Max tokens per chunk")
     parser.add_argument("--no-merge", action="store_true", help="Don't save merged model")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Gradient accumulation steps")
     
     args = parser.parse_args()
     
