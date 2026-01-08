@@ -1,415 +1,368 @@
 """
-Evaluate fine-tuned model on training examples.
+Evaluation module for fine-tuned financial extraction model.
 
-This script loads the fine-tuned LoRA adapter and evaluates it against
-real examples from the training data to verify extraction accuracy.
+Compares model predictions against ground truth from the training set.
 
 Usage:
-    # Using MLX on Apple Silicon (local):
-    python src/evaluate.py --model_path outputs/qwen3-8b-financial-lora
-    
-    # Using Unsloth/CUDA:
-    python src/evaluate.py --model_path outputs/qwen3-8b-financial-lora --backend unsloth
+    python -m src.evaluate --model-path ./outputs/lora_adapters --num-samples 3
 """
 
 import json
 import argparse
 from pathlib import Path
-from typing import Dict, Any, Optional
-from loguru import logger
+from typing import Optional
+
+from pydantic import ValidationError
+
+from src.schema import FinancialMetrics, parse_json_from_response
 
 
-def load_test_examples(data_path: str = "data/train.jsonl", num_examples: int = 3) -> list:
-    """Load N examples from training data for evaluation."""
-    examples = []
-    with open(data_path, 'r') as f:
-        for i, line in enumerate(f):
-            if i >= num_examples:
-                break
-            if line.strip():
-                examples.append(json.loads(line))
-    logger.info(f"Loaded {len(examples)} examples for evaluation")
-    return examples
+# 3 samples from training set for quick evaluation
+EVAL_SAMPLES = [
+    # Sample 1: Microsoft FY2023
+    {
+        "input": """ITEM 8. FINANCIAL STATEMENTS AND SUPPLEMENTARY DATA
+INCOME STATEMENTS
+| (In millions, except per share amounts) |  |  |  |
+| Year Ended June 30, | 2023 | 2022 | 2021 |
+| Total revenue | 211,915 | 198,270 | 168,088 |
+| Operating income | 88,523 | 83,383 | 69,916 |
+| Net income | $72,361 | $72,738 | $61,271 |
+| Diluted | $9.68 | $9.65 | $8.05 |
+
+BALANCE SHEETS
+| (In millions) |  |  |
+| June 30, | 2023 | 2022 |
+| Cash and cash equivalents | $34,704 | $13,931 |
+| Total assets | $411,976 | $364,840 |""",
+        "expected": {
+            "revenue": 211915000000,
+            "operating_income": 88523000000,
+            "net_income": 72361000000,
+            "total_assets": 411976000000,
+            "cash_and_equivalents": 34704000000,
+            "diluted_eps": 9.68,
+        },
+        "company": "Microsoft",
+        "fiscal_year": "FY2023",
+    },
+    # Sample 2: Apple FY2024
+    {
+        "input": """Apple Inc. CONSOLIDATED STATEMENTS OF OPERATIONS (In millions, except per-share amounts)
+| Years ended | September 28, 2024 | September 30, 2023 |
+| Total net sales | 391,035 | 383,285 |
+| Operating income | 123,216 | 114,301 |
+| Net income | $93,736 | $96,995 |
+| Diluted | $6.08 | $6.13 |
+
+CONSOLIDATED BALANCE SHEETS (In millions)
+| September 28, 2024 | September 30, 2023 |
+| Cash and cash equivalents | $29,943 | $29,965 |
+| Total assets | $364,980 | $352,583 |""",
+        "expected": {
+            "revenue": 391035000000,
+            "operating_income": 123216000000,
+            "net_income": 93736000000,
+            "total_assets": 364980000000,
+            "cash_and_equivalents": 29943000000,
+            "diluted_eps": 6.08,
+        },
+        "company": "Apple",
+        "fiscal_year": "FY2024",
+    },
+    # Sample 3: Tesla FY2022
+    {
+        "input": """Tesla, Inc. Consolidated Statements of Operations (in millions, except per share data)
+| Year Ended December 31, | 2022 | 2021 | 2020 |
+| Total revenues | 81,462 | 53,823 | 31,536 |
+| Income from operations | 13,656 | 6,523 | 1,994 |
+| Net income | 12,587 | 5,644 | 862 |
+| Diluted | $3.62 | $1.63 | $0.21 |
+
+Consolidated Balance Sheets (in millions)
+| December 31, | 2022 | 2021 |
+| Cash and cash equivalents | $16,253 | $17,576 |
+| Total assets | $82,338 | $62,131 |""",
+        "expected": {
+            "revenue": 81462000000,
+            "operating_income": 13656000000,
+            "net_income": 12587000000,
+            "total_assets": 82338000000,
+            "cash_and_equivalents": 16253000000,
+            "diluted_eps": 3.62,
+        },
+        "company": "Tesla",
+        "fiscal_year": "FY2022",
+    },
+]
 
 
-def extract_expected_output(example: Dict) -> Dict[str, Any]:
-    """Extract the expected JSON output from a training example."""
-    for msg in example["messages"]:
-        if msg["role"] == "assistant":
-            return json.loads(msg["content"])
-    return {}
+# System prompt from training
+SYSTEM_PROMPT = """You are a financial data extraction engine. You will receive a Markdown formatted financial document (SEC 10-K).
+
+Your goal is to extract specific metrics into a flat JSON object.
+
+### Extraction Rules:
+1. **Normalization:** Convert all numbers to their full integer value.
+   - Example: If the table header says "(In millions)" and the value is "14,527", output `14527000000`.
+   - Example: If the value is "5.61" (EPS), keep it as `5.61`.
+2. **Missing Data:** If a specific metric is not explicitly stated, return `null`. Do not calculate fields yourself (e.g., do not subtract expenses from revenue to derive operating income). Extract only what is written.
+3. **Negative Values:** Return negative numbers as standard JSON integers (e.g., -500), not strings with parentheses.
+
+### Target Schema:
+{
+  "revenue": <int or null>,             // Total Net Sales / Revenue
+  "operating_income": <int or null>,    // Operating Income / Loss
+  "net_income": <int or null>,          // Net Income / Loss
+  "total_assets": <int or null>,        // Total Assets
+  "cash_and_equivalents": <int or null>,// Ending Cash & Cash Equivalents
+  "diluted_eps": <float or null>        // Diluted Earnings Per Share
+}
+"""
 
 
-def extract_user_content(example: Dict) -> str:
-    """Extract the user message (10-K content) from a training example."""
-    for msg in example["messages"]:
-        if msg["role"] == "user":
-            return msg["content"]
-    return ""
-
-
-def extract_system_prompt(example: Dict) -> str:
-    """Extract the system prompt from a training example."""
-    for msg in example["messages"]:
-        if msg["role"] == "system":
-            return msg["content"]
-    return ""
-
-
-def compare_outputs(expected: Dict, actual: Dict) -> Dict[str, Any]:
+def calculate_metrics(prediction: dict, expected: dict) -> dict:
     """
-    Compare expected vs actual extraction results.
+    Calculate evaluation metrics for a single prediction.
     
+    Args:
+        prediction: Model's predicted values
+        expected: Ground truth values
+        
     Returns:
-        Dict with comparison metrics
+        Dict with per-field accuracy and error metrics
     """
+    fields = ["revenue", "operating_income", "net_income", 
+              "total_assets", "cash_and_equivalents", "diluted_eps"]
+    
     results = {
-        "total_keys": 0,
-        "matched_keys": 0,
-        "value_matches": 0,
-        "value_mismatches": [],
-        "missing_keys": [],
-        "extra_keys": [],
+        "correct_fields": 0,
+        "total_fields": len(fields),
+        "field_details": {},
     }
     
-    expected_keys = set(expected.keys())
-    actual_keys = set(actual.keys())
-    
-    results["total_keys"] = len(expected_keys)
-    results["matched_keys"] = len(expected_keys & actual_keys)
-    results["missing_keys"] = list(expected_keys - actual_keys)
-    results["extra_keys"] = list(actual_keys - expected_keys)
-    
-    # Compare values for matching keys
-    for key in expected_keys & actual_keys:
-        exp_val = expected[key]
-        act_val = actual.get(key)
+    for field in fields:
+        pred_val = prediction.get(field)
+        exp_val = expected.get(field)
         
-        # Handle nested value/unit structure
-        if isinstance(exp_val, dict) and isinstance(act_val, dict):
-            exp_v = exp_val.get("value")
-            act_v = act_val.get("value")
+        # Check exact match (with tolerance for floats)
+        if pred_val is None and exp_val is None:
+            is_correct = True
+            error_pct = 0.0
+        elif pred_val is None or exp_val is None:
+            is_correct = False
+            error_pct = 100.0  # Missing value
+        elif isinstance(exp_val, float):
+            # Float comparison with tolerance
+            is_correct = abs(pred_val - exp_val) < 0.01
+            error_pct = abs(pred_val - exp_val) / abs(exp_val) * 100 if exp_val != 0 else 0
         else:
-            exp_v = exp_val
-            act_v = act_val
+            # Integer comparison - exact match required
+            is_correct = pred_val == exp_val
+            error_pct = abs(pred_val - exp_val) / abs(exp_val) * 100 if exp_val != 0 else 0
         
-        if exp_v == act_v:
-            results["value_matches"] += 1
-        else:
-            results["value_mismatches"].append({
-                "key": key,
-                "expected": exp_v,
-                "actual": act_v
-            })
+        results["field_details"][field] = {
+            "predicted": pred_val,
+            "expected": exp_val,
+            "correct": is_correct,
+            "error_pct": round(error_pct, 2),
+        }
+        
+        if is_correct:
+            results["correct_fields"] += 1
     
-    # Calculate accuracy
-    if results["total_keys"] > 0:
-        results["key_accuracy"] = results["matched_keys"] / results["total_keys"]
-        if results["matched_keys"] > 0:
-            results["value_accuracy"] = results["value_matches"] / results["matched_keys"]
-        else:
-            results["value_accuracy"] = 0.0
-    else:
-        results["key_accuracy"] = 0.0
-        results["value_accuracy"] = 0.0
-    
+    results["accuracy"] = results["correct_fields"] / results["total_fields"]
     return results
 
 
-def run_inference_mlx(model_path: str, messages: list) -> str:
-    """Run inference using MLX-LM (for Apple Silicon).
-    
-    For LoRA adapters, loads the base Qwen3 model and applies the adapter.
-    """
-    try:
-        from mlx_lm import load, generate
-        from pathlib import Path
-        
-        model_path = Path(model_path)
-        
-        # Check if this is a LoRA adapter (has adapter_config.json but no config.json)
-        is_lora_adapter = (
-            (model_path / "adapter_config.json").exists() and
-            not (model_path / "config.json").exists()
-        )
-        
-        if is_lora_adapter:
-            # Load adapter config to get base model name
-            import json
-            with open(model_path / "adapter_config.json", 'r') as f:
-                adapter_config = json.load(f)
-            
-            base_model = adapter_config.get("base_model_name_or_path", "Qwen/Qwen3-8B-Instruct")
-            logger.info(f"Loading base model: {base_model}")
-            logger.info(f"Applying LoRA adapter from: {model_path}")
-            
-            # Load base model with adapter
-            model, tokenizer = load(base_model, adapter_path=str(model_path,))
-        else:
-            # Load merged model directly
-            logger.info(f"Loading merged model: {model_path}")
-            model, tokenizer = load(str(model_path))
-        
-        # Format messages for Qwen
-        prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        
-        response = generate(
-            model, 
-            tokenizer, 
-            prompt=prompt,
-        )
-        return response
-    except ImportError:
-        logger.error("mlx-lm not installed. Install with: pip install mlx-lm")
-        raise
-
-
-def run_inference_unsloth(model_path: str, messages: list) -> str:
-    """Run inference using Unsloth (for CUDA GPUs)."""
-    try:
-        from unsloth import FastLanguageModel
-        from unsloth.chat_templates import get_chat_template
-        
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_path,
-            max_seq_length=8192,
-            load_in_4bit=True,
-        )
-        
-        FastLanguageModel.for_inference(model)
-        tokenizer = get_chat_template(tokenizer, chat_template="qwen-2.5")
-        
-        inputs = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt"
-        ).to(model.device)
-        
-        outputs = model.generate(
-            input_ids=inputs,
-            max_new_tokens=512,
-            # temperature=0.1,
-        )
-        
-        response = tokenizer.decode(outputs[0][inputs.shape[1]:], skip_special_tokens=True)
-        return response
-    except ImportError:
-        logger.error("unsloth not installed")
-        raise
-
-
-def parse_json_response(response: str) -> Optional[Dict]:
-    """Parse JSON from model response."""
-    import re
-    
-    # Try direct parse
-    try:
-        return json.loads(response.strip())
-    except:
-        pass
-    
-    # Try to find JSON in markdown code blocks
-    patterns = [r'```json\s*([\s\S]*?)\s*```', r'```\s*([\s\S]*?)\s*```', r'\{[\s\S]*\}']
-    for pattern in patterns:
-        match = re.search(pattern, response)
-        if match:
-            try:
-                json_str = match.group(1) if '```' in pattern else match.group(0)
-                return json.loads(json_str.strip())
-            except:
-                continue
-    
-    return None
-
-
-def evaluate(
+def evaluate_with_model(
     model_path: str,
-    data_path: str = "data/train.jsonl",
-    num_examples: int = 3,
-    backend: str = "mlx"
-) -> Dict[str, Any]:
+    model_type: str = "lora",
+    samples: list = None,
+    verbose: bool = True,
+) -> dict:
     """
-    Evaluate the fine-tuned model on training examples.
+    Evaluate model on samples.
     
     Args:
-        model_path: Path to LoRA adapter or merged model
-        data_path: Path to training JSONL
-        num_examples: Number of examples to evaluate
-        backend: "mlx" or "unsloth"
+        model_path: Path to model/adapters
+        model_type: Type of model (lora, merged, mlx)
+        samples: List of samples to evaluate (default: EVAL_SAMPLES)
+        verbose: Print detailed results
         
     Returns:
         Evaluation results dict
     """
-    logger.info(f"Evaluating model: {model_path}")
-    logger.info(f"Backend: {backend}")
+    from src.inference import FinancialExtractor
     
-    # Load examples
-    examples = load_test_examples(data_path, num_examples)
+    if samples is None:
+        samples = EVAL_SAMPLES
     
-    # Select inference function
-    if backend == "mlx":
-        run_inference = run_inference_mlx
-    else:
-        run_inference = run_inference_unsloth
+    # Load model
+    extractor = FinancialExtractor(
+        model_path=model_path,
+        model_type=model_type,
+    )
     
-    all_results = []
-    
-    for i, example in enumerate(examples):
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Example {i+1}/{len(examples)}")
-        logger.info(f"{'='*60}")
-        
-        # Extract components
-        system_prompt = extract_system_prompt(example)
-        user_content = extract_user_content(example)
-        expected = extract_expected_output(example)
-        
-        logger.info(f"Expected keys: {list(expected.keys())}")
-        
-        # Build messages with /no_think
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content + " /no_think"}
-        ]
-        
-        # Run inference
-        logger.info("Running inference...")
-        try:
-            response = run_inference(model_path, messages)
-            logger.info(f"Raw response (first 500 chars): {response[:500]}")
-            
-            # Parse response
-            actual = parse_json_response(response)
-            
-            if actual is None:
-                logger.error("Failed to parse JSON from response")
-                result = {
-                    "example_id": i,
-                    "success": False,
-                    "error": "JSON parse failed",
-                    "raw_response": response[:1000]
-                }
-            else:
-                # Compare
-                comparison = compare_outputs(expected, actual)
-                result = {
-                    "example_id": i,
-                    "success": True,
-                    "expected": expected,
-                    "actual": actual,
-                    "comparison": comparison
-                }
-                
-                logger.info(f"Key accuracy: {comparison['key_accuracy']:.1%}")
-                logger.info(f"Value accuracy: {comparison['value_accuracy']:.1%}")
-                
-                if comparison["value_mismatches"]:
-                    logger.warning(f"Mismatches: {comparison['value_mismatches']}")
-                    
-        except Exception as e:
-            logger.exception(f"Inference failed: {e}")
-            result = {
-                "example_id": i,
-                "success": False,
-                "error": str(e)
-            }
-        
-        all_results.append(result)
-    
-    # Summary
-    logger.info(f"\n{'='*60}")
-    logger.info("EVALUATION SUMMARY")
-    logger.info(f"{'='*60}")
-    
-    successful = [r for r in all_results if r.get("success")]
-    logger.info(f"Successful extractions: {len(successful)}/{len(all_results)}")
-    
-    if successful:
-        avg_key_acc = sum(r["comparison"]["key_accuracy"] for r in successful) / len(successful)
-        avg_val_acc = sum(r["comparison"]["value_accuracy"] for r in successful) / len(successful)
-        logger.info(f"Average key accuracy: {avg_key_acc:.1%}")
-        logger.info(f"Average value accuracy: {avg_val_acc:.1%}")
-    
-    return {
-        "model_path": model_path,
-        "num_examples": len(examples),
-        "results": all_results
+    results = {
+        "samples": [],
+        "overall_accuracy": 0.0,
+        "per_field_accuracy": {},
     }
+    
+    total_correct = 0
+    total_fields = 0
+    field_correct_counts = {}
+    
+    for i, sample in enumerate(samples):
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Sample {i+1}: {sample['company']} {sample['fiscal_year']}")
+            print(f"{'='*60}")
+        
+        # Get prediction
+        raw_dict, validated = extractor.extract(sample["input"])
+        
+        # Use validated if available, else raw
+        prediction = validated.model_dump() if validated else raw_dict
+        
+        # Calculate metrics
+        metrics = calculate_metrics(prediction, sample["expected"])
+        
+        sample_result = {
+            "company": sample["company"],
+            "fiscal_year": sample["fiscal_year"],
+            "prediction": prediction,
+            "expected": sample["expected"],
+            "metrics": metrics,
+        }
+        results["samples"].append(sample_result)
+        
+        # Aggregate
+        total_correct += metrics["correct_fields"]
+        total_fields += metrics["total_fields"]
+        
+        for field, details in metrics["field_details"].items():
+            if field not in field_correct_counts:
+                field_correct_counts[field] = {"correct": 0, "total": 0}
+            field_correct_counts[field]["total"] += 1
+            if details["correct"]:
+                field_correct_counts[field]["correct"] += 1
+        
+        if verbose:
+            print(f"Accuracy: {metrics['accuracy']*100:.1f}% ({metrics['correct_fields']}/{metrics['total_fields']} fields)")
+            print("\nField Details:")
+            for field, details in metrics["field_details"].items():
+                status = "✓" if details["correct"] else "✗"
+                print(f"  {status} {field}:")
+                print(f"      Predicted: {details['predicted']}")
+                print(f"      Expected:  {details['expected']}")
+                if not details["correct"]:
+                    print(f"      Error: {details['error_pct']}%")
+    
+    # Overall metrics
+    results["overall_accuracy"] = total_correct / total_fields if total_fields > 0 else 0
+    results["per_field_accuracy"] = {
+        field: counts["correct"] / counts["total"]
+        for field, counts in field_correct_counts.items()
+    }
+    
+    if verbose:
+        print(f"\n{'='*60}")
+        print("OVERALL RESULTS")
+        print(f"{'='*60}")
+        print(f"Overall Accuracy: {results['overall_accuracy']*100:.1f}% ({total_correct}/{total_fields} fields)")
+        print("\nPer-field Accuracy:")
+        for field, acc in results["per_field_accuracy"].items():
+            print(f"  {field}: {acc*100:.1f}%")
+    
+    return results
+
+
+def evaluate_without_model(verbose: bool = True) -> None:
+    """
+    Display evaluation samples without running inference.
+    Useful when model is not available locally.
+    """
+    print("\n" + "="*60)
+    print("EVALUATION SAMPLES (without model inference)")
+    print("="*60)
+    print("\nThese 3 samples can be used to evaluate your fine-tuned model:")
+    
+    for i, sample in enumerate(EVAL_SAMPLES, 1):
+        print(f"\n{'─'*60}")
+        print(f"Sample {i}: {sample['company']} {sample['fiscal_year']}")
+        print(f"{'─'*60}")
+        print("\nInput (truncated):")
+        input_preview = sample["input"][:500] + "..." if len(sample["input"]) > 500 else sample["input"]
+        print(input_preview)
+        print("\nExpected Output:")
+        print(json.dumps(sample["expected"], indent=2))
+    
+    print("\n" + "="*60)
+    print("To run evaluation with your model, use:")
+    print("  python -m src.evaluate --model-path ./outputs/lora_adapters")
+    print("="*60)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate fine-tuned financial extraction model")
-    parser.add_argument("--model_path", type=str, default="outputs/qwen3-8b-financial-lora",
-                        help="Path to fine-tuned model")
-    parser.add_argument("--data_path", type=str, default="data/train.jsonl",
-                        help="Path to evaluation data")
-    parser.add_argument("--num_examples", type=int, default=3,
-                        help="Number of examples to evaluate")
-    parser.add_argument("--backend", type=str, default="mlx", choices=["mlx", "unsloth"],
-                        help="Inference backend")
-    parser.add_argument("--output", type=str, default="logs/eval_results.json",
-                        help="Save results to JSON file")
+    """CLI entry point for evaluation."""
+    parser = argparse.ArgumentParser(description="Evaluate financial extraction model")
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        help="Path to saved model/adapters (omit to just show samples)",
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        choices=["lora", "merged", "mlx"],
+        default="lora",
+        help="Type of saved model",
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=3,
+        help="Number of samples to evaluate (max 3)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        help="Output file path for results JSON",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress verbose output",
+    )
     
     args = parser.parse_args()
     
-    # Setup logging
-    Path("logs").mkdir(exist_ok=True)
-    logger.add("logs/evaluate_{time}.log", rotation="10 MB")
+    if not args.model_path:
+        # Just show samples without running model
+        evaluate_without_model()
+        return 0
     
-    results = evaluate(
+    # Select samples
+    samples = EVAL_SAMPLES[:min(args.num_samples, len(EVAL_SAMPLES))]
+    
+    # Run evaluation
+    results = evaluate_with_model(
         model_path=args.model_path,
-        data_path=args.data_path,
-        num_examples=args.num_examples,
-        backend=args.backend
+        model_type=args.model_type,
+        samples=samples,
+        verbose=not args.quiet,
     )
     
-    # Always save detailed results
-    output_path = args.output
-    with open(output_path, 'w') as f:
-        json.dump(results, f, indent=2, default=str)
-    logger.info(f"Detailed results saved to {output_path}")
+    # Save results if requested
+    if args.output:
+        with open(args.output, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\nResults saved to {args.output}")
     
-    # Also save human-readable comparison
-    comparison_path = output_path.replace('.json', '_comparison.txt')
-    with open(comparison_path, 'w') as f:
-        f.write("=" * 80 + "\n")
-        f.write("MODEL OUTPUT vs GROUND TRUTH COMPARISON\n")
-        f.write("=" * 80 + "\n\n")
-        
-        for r in results["results"]:
-            f.write(f"Example {r['example_id'] + 1}\n")
-            f.write("-" * 40 + "\n")
-            
-            if r.get("success"):
-                f.write("STATUS: SUCCESS\n\n")
-                f.write("GROUND TRUTH:\n")
-                f.write(json.dumps(r["expected"], indent=2) + "\n\n")
-                f.write("MODEL OUTPUT:\n")
-                f.write(json.dumps(r["actual"], indent=2) + "\n\n")
-                
-                comp = r["comparison"]
-                f.write(f"Key Accuracy: {comp['key_accuracy']:.1%}\n")
-                f.write(f"Value Accuracy: {comp['value_accuracy']:.1%}\n")
-                
-                if comp["value_mismatches"]:
-                    f.write("\nMISMATCHES:\n")
-                    for m in comp["value_mismatches"]:
-                        f.write(f"  {m['key']}: expected={m['expected']}, got={m['actual']}\n")
-            else:
-                f.write(f"STATUS: FAILED\n")
-                f.write(f"ERROR: {r.get('error', 'Unknown')}\n")
-                if "raw_response" in r:
-                    f.write(f"\nRAW RESPONSE:\n{r['raw_response'][:2000]}\n")
-            
-            f.write("\n" + "=" * 80 + "\n\n")
-    
-    logger.info(f"Human-readable comparison saved to {comparison_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
