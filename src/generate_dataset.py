@@ -213,13 +213,7 @@ def main():
 
                 # 2. Call LLM
                 extracted_data = call_llm(text, current_system_prompt)
-                
-                # Check if extraction succeeded
-                if not extracted_data:
-                    logger.error(f"Extraction returned no data: {file_path.name}")
-                    continue
-                
-                # Check if the extraction resulted in ALL nulls
+                # 1. Check if the extraction resulted in ALL nulls
                 non_null_count = sum(1 for v in extracted_data.values() if v is not None)
 
                 # 2. Logic: Drop if completely empty (or save to a separate 'negatives' file)

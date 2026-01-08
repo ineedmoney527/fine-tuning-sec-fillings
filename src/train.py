@@ -1,33 +1,26 @@
 """
 QLoRA fine-tuning script for Qwen3-8B-Instruct using Unsloth.
-
-This script fine-tunes the model for structured financial entity extraction
-from SEC 10-K reports using QLoRA (4-bit quantization + LoRA adapters).
-
-Includes chunking support for training on long documents with limited context.
 """
 
 import os
+# MUST be set before importing unsloth/transformers for custom loss to work
+os.environ['UNSLOTH_RETURN_LOGITS'] = '1'
+
 import json
 import argparse
-from pathlib import Path
 from typing import List, Dict, Any
 
 import torch
 from datasets import Dataset
 from loguru import logger
 
-from chunking import estimate_tokens, chunk_document
-
-
 # =================CONFIGURATION=================
-DEFAULT_MODEL = "unsloth/Qwen3-8B"
-DEFAULT_OUTPUT_DIR = "outputs/qwen3-8b-financial-lora"
+DEFAULT_MODEL = "unsloth/Qwen2.5-7B-Instruct" # Or Qwen/Qwen2.5-7B-Instruct
+DEFAULT_OUTPUT_DIR = "outputs/qwen-financial-32k"
 DEFAULT_DATA_PATH = "data/train.jsonl"
 
-# Chunking configuration for training data
-MAX_TRAIN_TOKENS = 4096  # Max tokens per training example
-OVERLAP_TOKENS = 200     # Overlap for context continuity
+# Expanded Context Window
+MAX_SEQ_LENGTH = 32768 
 
 # Custom loss weights for financial tokens
 FINANCIAL_KEYS = {
@@ -37,121 +30,58 @@ FINANCIAL_KEYS = {
     "earnings_per_share_basic", "earnings_per_share_diluted",
     "total_current_assets", "total_liabilities", "total_shareholders_equity"
 }
+
+# Define weights for specific token types
 WEIGHTS = {
-    "json_key": 2.0,
-    "number": 1.5,
-    "json_structure": 1.2,
+    "json_key": 2.0,       # Heavily penalize errors in JSON keys
+    "number": 1.5,         # Penalize errors in numbers
+    "json_structure": 1.2, # {},:[]
     "default": 1.0
 }
 
+def load_data(data_path: str, tokenizer) -> List[Dict[str, Any]]:
+    """
+    Load training data
+    Applies chat template to the full document content.
+    """
+    try:
+        data = [json.loads(line) for line in open(data_path) if line.strip()]
+    except FileNotFoundError:
+        logger.error(f"File not found: {data_path}")
+        raise
 
-def load_and_chunk_data(
-    data_path: str,
-    tokenizer,
-    max_tokens: int = MAX_TRAIN_TOKENS,
-    overlap_tokens: int = OVERLAP_TOKENS
-) -> List[Dict[str, Any]]:
-    """
-    Load training data and chunk long examples.
-    
-    For examples exceeding max_tokens, creates multiple training examples
-    from chunks of the user content.
-    
-    Args:
-        data_path: Path to JSONL training file
-        tokenizer: Tokenizer for applying chat template
-        max_tokens: Maximum tokens per training example
-        overlap_tokens: Overlap between chunks
-        
-    Returns:
-        List of formatted training examples with 'text' field
-    """
-    data = [json.loads(line) for line in open(data_path) if line.strip()]
     logger.info(f"Loaded {len(data)} raw examples from {data_path}")
     
     formatted_data = []
-    chunked_count = 0
     
     for ex in data:
         messages = ex.get("messages", [])
         
-        # Find user message (document content)
-        user_content = None
-        system_content = None
-        assistant_content = None
-        
+        # Simple processing: Apply chat template to the whole conversation
+        # We append /no_think to user messages if using a reasoning model that supports it, 
+        # otherwise remove it if using standard Qwen/Llama.
+        processed_messages = []
         for msg in messages:
-            if msg["role"] == "system":
-                system_content = msg["content"]
-            elif msg["role"] == "user":
-                user_content = msg["content"]
-            elif msg["role"] == "assistant":
-                assistant_content = msg["content"]
+            content = msg["content"]
+            # Optional: Add specific prompting tweaks here if needed
+            processed_messages.append({"role": msg["role"], "content": content})
         
-        if not user_content:
-            continue
+        text = tokenizer.apply_chat_template(
+            processed_messages,
+            tokenize=False,
+            add_generation_prompt=False
+        )
         
-        # Check if chunking is needed
-        token_estimate = estimate_tokens(user_content)
-        
-        if token_estimate > max_tokens:
-            # Chunk the user content
-            chunks = chunk_document(user_content, max_tokens, overlap_tokens)
-            chunked_count += 1
-            
-            for i, chunk in enumerate(chunks):
-                # Create training example for each chunk
-                # All chunks share the same expected output (full extraction)
-                chunk_messages = []
-                if system_content:
-                    chunk_messages.append({"role": "system", "content": system_content})
-                
-                # Add /no_think suffix for Qwen3 thinking mode
-                chunk_messages.append({
-                    "role": "user", 
-                    "content": chunk + " /no_think"
-                })
-                
-                if assistant_content:
-                    chunk_messages.append({"role": "assistant", "content": assistant_content})
-                
-                text = tokenizer.apply_chat_template(
-                    chunk_messages, 
-                    tokenize=False, 
-                    add_generation_prompt=False
-                )
-                formatted_data.append({"text": text, "source": f"{ex.get('source', 'unknown')}_chunk{i}"})
-        else:
-            # No chunking needed
-            formatted_messages = []
-            for msg in messages:
-                content = msg["content"]
-                if msg["role"] == "user":
-                    content += " /no_think"
-                formatted_messages.append({"role": msg["role"], "content": content})
-            
-            text = tokenizer.apply_chat_template(
-                formatted_messages,
-                tokenize=False,
-                add_generation_prompt=False
-            )
-            formatted_data.append({"text": text, "source": ex.get("source", "unknown")})
+        formatted_data.append({"text": text})
     
-    logger.info(f"Created {len(formatted_data)} training examples ({chunked_count} documents were chunked)")
+    logger.info(f"Prepared {len(formatted_data)} full-context training examples")
     return formatted_data
 
 
 def create_custom_trainer(SFTTrainer, tokenizer):
     """
     Create custom trainer with token-weighted loss for financial extraction.
-    
-    Weights:
-    - Financial JSON keys: 2.0x
-    - Numbers: 1.5x  
-    - JSON structure: 1.2x
-    - Default: 1.0x
     """
-    
     class CustomFinancialTrainer(SFTTrainer):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -160,6 +90,7 @@ def create_custom_trainer(SFTTrainer, tokenizer):
             # Pre-compute token sets for efficient lookup
             self.key_tokens = set()
             for key in FINANCIAL_KEYS:
+                # Encode both "key" and key variants
                 self.key_tokens.update(tok.encode(f'"{key}"', add_special_tokens=False))
                 self.key_tokens.update(tok.encode(key, add_special_tokens=False))
             
@@ -171,20 +102,31 @@ def create_custom_trainer(SFTTrainer, tokenizer):
             for char in '0123456789.-':
                 self.digit_tokens.update(tok.encode(char, add_special_tokens=False))
             
-            logger.info(f"CustomFinancialTrainer initialized with {len(self.key_tokens)} key tokens")
+            logger.info(f"CustomTrainer initialized. Tracking {len(self.key_tokens)} key tokens.")
         
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            # Standard forward pass
             labels = inputs.get("labels", inputs["input_ids"].clone())
             outputs = model(**inputs)
+            
+            # Get logits
             logits = outputs.logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             
-            # Build weight tensor
+            # Build weight tensor (Shape: Batch x Seq_Len)
             weights = torch.ones_like(shift_labels, dtype=torch.float32)
+            
+            # CPU calculation for weights is safer to avoid complex indexing on GPU
+            # but we do it on device for speed if possible. 
+            # Iterating tokens is slow in Python, but fine for small batch sizes.
+            
+            # Optimization: Create boolean masks for vectorization if possible, 
+            # otherwise sticking to loop for clarity/safety with variable token IDs.
             for b in range(shift_labels.shape[0]):
                 for i in range(shift_labels.shape[1]):
                     token_id = shift_labels[b, i].item()
-                    if token_id == -100:
+                    
+                    if token_id == -100: # Ignored token
                         weights[b, i] = 0.0
                     elif token_id in self.key_tokens:
                         weights[b, i] = WEIGHTS["json_key"]
@@ -195,13 +137,18 @@ def create_custom_trainer(SFTTrainer, tokenizer):
             
             weights = weights.to(logits.device)
             
-            # Weighted cross-entropy loss
+            # Weighted cross-entropy
             loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
+            # flatten tensors
             loss = loss_fn(logits.view(-1, logits.size(-1)), shift_labels.view(-1))
             
-            mask = weights.view(-1) > 0
+            # Apply weights
+            flat_weights = weights.view(-1)
+            mask = flat_weights > 0
+            
             if mask.sum() > 0:
-                loss = (loss * weights.view(-1))[mask].sum() / weights.view(-1)[mask].sum()
+                # Average loss over valid tokens only
+                loss = (loss * flat_weights)[mask].sum() / flat_weights[mask].sum()
             else:
                 loss = loss.sum()
             
@@ -214,98 +161,55 @@ def train(
     model_name: str = DEFAULT_MODEL,
     data_path: str = DEFAULT_DATA_PATH,
     output_dir: str = DEFAULT_OUTPUT_DIR,
-    max_seq_length: int = 8192,
+    max_seq_length: int = MAX_SEQ_LENGTH,
     num_epochs: int = 3,
-    batch_size: int = 2,
+    batch_size: int = 1, # Kept low for 32k context
     gradient_accumulation_steps: int = 4,
     learning_rate: float = 2e-4,
-    use_chunking: bool = True,
-    max_train_tokens: int = MAX_TRAIN_TOKENS,
     save_merged: bool = True
 ):
-    """
-    Run QLoRA fine-tuning with Unsloth.
-    
-    Args:
-        model_name: Base model to fine-tune
-        data_path: Path to training JSONL
-        output_dir: Directory to save model
-        max_seq_length: Maximum sequence length
-        num_epochs: Number of training epochs
-        batch_size: Per-device batch size
-        gradient_accumulation_steps: Gradient accumulation
-        learning_rate: Learning rate
-        use_chunking: Whether to chunk long training examples
-        max_train_tokens: Max tokens per chunk (if chunking enabled)
-        save_merged: Whether to save merged model (not just LoRA)
-    """
-    # CRITICAL: Enable logits for custom loss (Unsloth disables by default)
-    os.environ['UNSLOTH_RETURN_LOGITS'] = '1'
-    
-    # Import Unsloth (requires GPU)
     try:
         from unsloth import FastLanguageModel
         from unsloth.chat_templates import get_chat_template
     except ImportError:
-        logger.error("Unsloth not installed. Run: pip install unsloth")
+        logger.error("Unsloth not installed.")
         raise
     
     from trl import SFTTrainer, SFTConfig
     
-    # Load model
-    logger.info(f"Loading model: {model_name}")
+    # 1. Load Model
+    logger.info(f"Loading model: {model_name} with context window: {max_seq_length}")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_name,
         max_seq_length=max_seq_length,
-        dtype=None,  # Auto-detect
+        dtype=None, 
         load_in_4bit=True,
     )
     
-    # Configure LoRA
+    # 2. Configure LoRA
     logger.info("Configuring LoRA adapters...")
     model = FastLanguageModel.get_peft_model(
         model,
         r=16,
         lora_alpha=32,
-        # lora_dropout=0.05,
+        lora_dropout=0.05,
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj"
         ],
         bias="none",
-        use_gradient_checkpointing="unsloth",
+        use_gradient_checkpointing="unsloth", 
         random_state=42,
     )
     
-    # Set up tokenizer
+    # 3. Tokenizer Setup
     tokenizer = get_chat_template(tokenizer, chat_template="qwen-2.5")
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
     
-    # Load and optionally chunk data
-    logger.info(f"Loading training data from {data_path}...")
-    if use_chunking:
-        formatted_data = load_and_chunk_data(
-            data_path, tokenizer, 
-            max_tokens=max_train_tokens,
-            overlap_tokens=OVERLAP_TOKENS
-        )
-    else:
-        # Load without chunking
-        data = [json.loads(line) for line in open(data_path) if line.strip()]
-        formatted_data = []
-        for ex in data:
-            messages = [
-                {"role": m["role"], "content": m["content"] + " /no_think" if m["role"] == "user" else m["content"]}
-                for m in ex["messages"]
-            ]
-            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-            formatted_data.append({"text": text})
-    
+    # 4. Load Data (No Chunking)
+    formatted_data = load_data(data_path, tokenizer)
     dataset = Dataset.from_list(formatted_data)
-    logger.info(f"Training dataset: {len(dataset)} examples")
     
-    # Training config
+    # 5. Training Config
     training_args = SFTConfig(
         output_dir=output_dir,
         per_device_train_batch_size=batch_size,
@@ -313,7 +217,7 @@ def train(
         warmup_steps=5,
         num_train_epochs=num_epochs,
         learning_rate=learning_rate,
-        fp16=True,
+        fp16=True, # Use bf16=True if on Ampere (A100/A10), fp16 for T4
         logging_steps=1,
         save_strategy="epoch",
         optim="adamw_8bit",
@@ -321,53 +225,47 @@ def train(
         lr_scheduler_type="linear",
         seed=42,
         max_seq_length=max_seq_length,
-        packing=False,
         dataset_text_field="text",
+        packing=False, # Packing can be tricky with very long contexts on low VRAM
     )
     
-    # Create custom trainer
-    CustomTrainer = create_custom_trainer(SFTTrainer, tokenizer)
-    trainer = SFTTrainer(
+    # 6. Initialize CUSTOM Trainer
+    # IMPORTANT: We use the class generator to inject the tokenizer
+    CustomTrainerClass = create_custom_trainer(SFTTrainer, tokenizer)
+    
+    trainer = CustomTrainerClass( # <--- USING CUSTOM TRAINER HERE
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
         args=training_args
     )
     
-    # Train
+    # 7. Train
     logger.info("Starting training...")
-    trainer.train()
+    trainer_stats = trainer.train()
     logger.success("Training complete!")
     
-    # Save model
+    # 8. Save
     logger.info(f"Saving LoRA adapters to {output_dir}")
     trainer.save_model(output_dir)
     
     if save_merged:
         merged_dir = f"{output_dir}-merged"
         logger.info(f"Saving merged model to {merged_dir}")
+        # Use merged_16bit for safer export, or merged_4bit to save space
         model.save_pretrained_merged(merged_dir, tokenizer, save_method="merged_16bit")
-        logger.success(f"Merged model saved to {merged_dir}")
-    
+        
     return output_dir
 
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Fine-tune Qwen3 for financial extraction with QLoRA"
-    )
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Base model name")
-    parser.add_argument("--data", default=DEFAULT_DATA_PATH, help="Training data path")
-    parser.add_argument("--output", default=DEFAULT_OUTPUT_DIR, help="Output directory")
-    parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
-    parser.add_argument("--batch-size", type=int, default=2, help="Batch size")
-    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
-    parser.add_argument("--max-seq-length", type=int, default=8192, help="Max sequence length")
-    parser.add_argument("--no-chunking", action="store_true", help="Disable training data chunking")
-    parser.add_argument("--max-chunk-tokens", type=int, default=MAX_TRAIN_TOKENS, 
-                        help="Max tokens per chunk")
-    parser.add_argument("--no-merge", action="store_true", help="Don't save merged model")
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Gradient accumulation steps")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--data", default=DEFAULT_DATA_PATH)
+    parser.add_argument("--output", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=1) # Default to 1 for 32k context safety
+    parser.add_argument("--accum", type=int, default=8) # Higher accum to compensate for batch size 1
+    parser.add_argument("--max-length", type=int, default=32768)
     
     args = parser.parse_args()
     
@@ -375,15 +273,11 @@ def main():
         model_name=args.model,
         data_path=args.data,
         output_dir=args.output,
-        max_seq_length=args.max_seq_length,
+        max_seq_length=args.max_length,
         num_epochs=args.epochs,
         batch_size=args.batch_size,
-        learning_rate=args.lr,
-        use_chunking=not args.no_chunking,
-        max_train_tokens=args.max_chunk_tokens,
-        save_merged=not args.no_merge
+        gradient_accumulation_steps=args.accum
     )
-
 
 if __name__ == "__main__":
     main()

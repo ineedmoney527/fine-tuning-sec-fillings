@@ -1,236 +1,138 @@
 """
-Inference module for fine-tuned financial extraction model.
-
-This module handles inference with chunking support for long documents,
-designed for use with smaller fine-tuned models that have limited context windows.
+Inference script for Qwen3-8B Financial Extraction.
+Loads the fine-tuned model and runs a test on the first example from the training set.
 """
 
 import json
+import torch
+import argparse
 from pathlib import Path
-from typing import Dict, Any, Optional, List
 from loguru import logger
+from unsloth import FastLanguageModel
 
-from chunking import estimate_tokens, chunk_document, merge_extraction_results
-from data import get_system_prompt
-from schema import FinancialMetrics, parse_json_from_response
+# =================CONFIGURATION=================
+DEFAULT_MODEL_PATH = "outputs/qwen-financial-32k" # Path to your saved LoRA or merged model
+DATA_PATH = "data/train.jsonl"
+MAX_SEQ_LENGTH = 32768
+LOAD_IN_4BIT = True
 
-
-# Default configuration for fine-tuned model inference
-DEFAULT_MAX_TOKENS = 2048  # Smaller context for fine-tuned models
-DEFAULT_OVERLAP_TOKENS = 200
-
-
-class FinancialExtractor:
+def load_model(model_path):
     """
-    Financial data extractor using a fine-tuned model.
-    
-    Automatically chunks long documents and merges extraction results.
+    Load the model and tokenizer. 
+    Unsloth handles loading both base model + adapters automatically if pointing to adapter dir.
     """
+    logger.info(f"Loading model from: {model_path}")
     
-    def __init__(
-        self,
-        model_path: str,
-        max_tokens: int = DEFAULT_MAX_TOKENS,
-        overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
-        device: str = "auto"
-    ):
-        """
-        Initialize the extractor with a fine-tuned model.
-        
-        Args:
-            model_path: Path to the fine-tuned model (LoRA adapter or merged)
-            max_tokens: Maximum tokens per chunk
-            overlap_tokens: Overlap between chunks for context continuity
-            device: Device to run inference on ("auto", "cuda", "mps", "cpu")
-        """
-        self.model_path = model_path
-        self.max_tokens = max_tokens
-        self.overlap_tokens = overlap_tokens
-        self.device = device
-        
-        self.model = None
-        self.tokenizer = None
-        self.system_prompt = get_system_prompt()
-        
-    def load_model(self):
-        """Load the fine-tuned model and tokenizer."""
-        try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-            import torch
-            
-            logger.info(f"Loading model from {self.model_path}...")
-            
-            # Determine device
-            if self.device == "auto":
-                if torch.cuda.is_available():
-                    device_map = "cuda"
-                elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                    device_map = "mps"
-                else:
-                    device_map = "cpu"
-            else:
-                device_map = self.device
-            
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
-                torch_dtype=torch.float16 if device_map != "cpu" else torch.float32,
-                device_map=device_map
-            )
-            
-            logger.info(f"Model loaded on {device_map}")
-            
-        except ImportError:
-            logger.error("transformers package not installed. Run: pip install transformers torch")
-            raise
-    
-    def _generate_response(self, text: str) -> str:
-        """
-        Generate extraction response for a single chunk.
-        
-        Args:
-            text: Document text (chunk or full document)
-            
-        Returns:
-            Raw model response string
-        """
-        if self.model is None:
-            self.load_model()
-        
-        # Format as chat messages
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": text}
-        ]
-        
-        # Apply chat template
-        prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        
-        # Generate
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=512,
-            temperature=0.1,
-            do_sample=True,
-            pad_token_id=self.tokenizer.eos_token_id
-        )
-        
-        # Decode response (only the new tokens)
-        response = self.tokenizer.decode(
-            outputs[0][inputs["input_ids"].shape[1]:],
-            skip_special_tokens=True
-        )
-        
-        return response
-    
-    def extract(self, text: str) -> Dict[str, Any]:
-        """
-        Extract financial metrics from document text.
-        
-        Automatically chunks long documents and merges results.
-        
-        Args:
-            text: Full document text
-            
-        Returns:
-            Dictionary of extracted financial metrics
-        """
-        token_estimate = estimate_tokens(text)
-        
-        if token_estimate > self.max_tokens:
-            # Document needs chunking
-            logger.info(f"Document ~{token_estimate} tokens, chunking into pieces...")
-            chunks = chunk_document(text, self.max_tokens, self.overlap_tokens)
-            
-            chunk_results = []
-            for i, chunk in enumerate(chunks):
-                logger.debug(f"Processing chunk {i+1}/{len(chunks)}...")
-                try:
-                    response = self._generate_response(chunk)
-                    result = parse_json_from_response(response)
-                    chunk_results.append(result)
-                except Exception as e:
-                    logger.warning(f"Chunk {i+1} extraction failed: {e}")
-                    continue
-            
-            if chunk_results:
-                merged = merge_extraction_results(chunk_results)
-                logger.info(f"Merged {len(chunk_results)} chunk results")
-                return merged
-            else:
-                logger.error("All chunks failed extraction")
-                return {}
-        else:
-            # Single extraction
-            response = self._generate_response(text)
-            return parse_json_from_response(response)
-    
-    def extract_validated(self, text: str) -> FinancialMetrics:
-        """
-        Extract and validate financial metrics.
-        
-        Args:
-            text: Full document text
-            
-        Returns:
-            Validated FinancialMetrics object
-        """
-        raw_result = self.extract(text)
-        return FinancialMetrics.model_validate(raw_result)
-
-
-def extract_from_file(
-    file_path: str,
-    model_path: str,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
-    overlap_tokens: int = DEFAULT_OVERLAP_TOKENS
-) -> Dict[str, Any]:
-    """
-    Convenience function to extract metrics from a file.
-    
-    Args:
-        file_path: Path to the document file
-        model_path: Path to the fine-tuned model
-        max_tokens: Maximum tokens per chunk
-        overlap_tokens: Overlap between chunks
-        
-    Returns:
-        Dictionary of extracted financial metrics
-    """
-    extractor = FinancialExtractor(
-        model_path=model_path,
-        max_tokens=max_tokens,
-        overlap_tokens=overlap_tokens
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_path,
+        max_seq_length=MAX_SEQ_LENGTH,
+        dtype=None,
+        load_in_4bit=LOAD_IN_4BIT,
     )
     
-    text = Path(file_path).read_text(encoding="utf-8")
-    return extractor.extract(text)
+    # Enable native 2x faster inference
+    FastLanguageModel.for_inference(model)
+    
+    return model, tokenizer
 
+def get_first_training_sample(file_path):
+    """Reads the first line of the JSONL file."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            first_line = f.readline()
+            if not first_line:
+                return None
+            return json.loads(first_line)
+    except FileNotFoundError:
+        logger.error(f"Could not find data file: {file_path}")
+        return None
+
+def run_inference(model, tokenizer, sample):
+    """
+    Reconstructs the prompt from the sample and generates output.
+    """
+    messages = sample["messages"]
+    
+    # Extract the parts we need
+    system_prompt = next((m["content"] for m in messages if m["role"] == "system"), "")
+    user_content = next((m["content"] for m in messages if m["role"] == "user"), "")
+    expected_output = next((m["content"] for m in messages if m["role"] == "assistant"), "")
+    
+    logger.info("Preparing prompt...")
+    
+    # Construct the chat template for inference
+    # Note: We do NOT include the assistant's response here, because we want the model to generate it.
+    prompt_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content}
+    ]
+    
+    # Apply template with add_generation_prompt=True to signal the model to start speaking
+    inputs = tokenizer.apply_chat_template(
+        prompt_messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt"
+    ).to("cuda")
+
+    logger.info("Generating response (this may take a moment for long docs)...")
+    
+    # Generate
+    outputs = model.generate(
+        input_ids=inputs,
+        max_new_tokens=1024,      # Enough for a JSON object
+        use_cache=True,
+        temperature=0.1,          # Low temp for factual extraction
+        top_p=0.9
+    )
+    
+    # Decode only the new tokens (the response)
+    # outputs[0] contains the full sequence (prompt + response). We slice to get just the response.
+    response_text = tokenizer.decode(outputs[0][len(inputs[0]):], skip_special_tokens=True)
+    
+    return response_text, expected_output
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default=DEFAULT_MODEL_PATH, help="Path to fine-tuned model/adapter")
+    parser.add_argument("--data", default=DATA_PATH, help="Path to training data")
+    args = parser.parse_args()
+
+    # 1. Load Data
+    sample = get_first_training_sample(args.data)
+    if not sample:
+        logger.error("No training data found to test.")
+        return
+
+    # 2. Load Model
+    model, tokenizer = load_model(args.model)
+
+    # 3. Run Inference
+    logger.info("--- INPUT METADATA ---")
+    # Parse the system prompt to see what keys were requested in this specific sample
+    sys_prompt = sample['messages'][0]['content']
+    requested_keys = [line.split('"')[1] for line in sys_prompt.split('\n') if '": {"value":' in line]
+    logger.info(f"Requested Keys in this sample: {requested_keys}")
+
+    generated_json_str, expected_json_str = run_inference(model, tokenizer, sample)
+
+    # 4. Compare Results
+    print("\n" + "="*50)
+    print("🤖 MODEL PREDICTION:")
+    print("="*50)
+    print(generated_json_str)
+    
+    print("\n" + "="*50)
+    print("✅ GROUND TRUTH:")
+    print("="*50)
+    print(expected_json_str)
+
+    # Optional: Basic JSON validation
+    try:
+        gen_json = json.loads(generated_json_str)
+        logger.success("Prediction is valid JSON.")
+    except json.JSONDecodeError:
+        logger.error("Prediction is NOT valid JSON.")
 
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Extract financial metrics from documents")
-    parser.add_argument("file", help="Path to document file")
-    parser.add_argument("--model", required=True, help="Path to fine-tuned model")
-    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
-                        help="Maximum tokens per chunk")
-    parser.add_argument("--overlap", type=int, default=DEFAULT_OVERLAP_TOKENS,
-                        help="Overlap tokens between chunks")
-    
-    args = parser.parse_args()
-    
-    result = extract_from_file(
-        args.file,
-        args.model,
-        max_tokens=args.max_tokens,
-        overlap_tokens=args.overlap
-    )
-    
-    print(json.dumps(result, indent=2))
+    main()
