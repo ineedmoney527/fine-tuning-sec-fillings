@@ -415,7 +415,7 @@ def train(
     
     # Create custom trainer with weighted loss
     CustomTrainer = create_custom_trainer(SFTTrainer, tokenizer)
-    trainer = CustomTrainer(
+    trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
