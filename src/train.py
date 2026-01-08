@@ -21,6 +21,10 @@ DEFAULT_MODEL = "unsloth/Qwen3-8B"
 DEFAULT_OUTPUT_DIR = "outputs/qwen3-8b-financial-lora"
 DEFAULT_DATA_PATH = "data/train.jsonl"
 
+# Sliding window chunking for long documents (T4 GPU limit: 2048 tokens)
+MAX_LENGTH = 2048  # Max tokens per chunk
+STRIDE = 256       # Overlap to prevent cutting words/context
+
 # Custom loss weights for financial tokens
 FINANCIAL_KEYS = {
     "revenue", "net_income", "operating_income", "total_assets", 
@@ -35,6 +39,218 @@ WEIGHTS = {
     "json_structure": 1.2,
     "default": 1.0
 }
+
+
+def extract_source_values(answer_json: str) -> List[str]:
+    """
+    Extract numeric values from the answer JSON and generate search patterns.
+    
+    SEC 10-K documents may show values in different scales:
+    - Raw: 211915000000
+    - In billions: 211.9 or 212
+    - In millions: 211,915
+    - In thousands: 211,915,000
+    
+    We generate patterns for all possible scales.
+    """
+    try:
+        data = json.loads(answer_json)
+    except json.JSONDecodeError:
+        return []
+    
+    patterns = []
+    
+    for key, value in data.items():
+        if value is None:
+            continue
+            
+        # Handle nested {"value": x, "unit": y} structure
+        if isinstance(value, dict) and "value" in value:
+            value = value["value"]
+            if value is None:
+                continue
+        
+        if isinstance(value, (int, float)):
+            # For floats (like EPS), add as-is
+            if isinstance(value, float):
+                patterns.append(f"{value}")
+                patterns.append(f"{value:.2f}")
+                continue
+            
+            # For integers, generate multiple scale formats
+            abs_val = abs(value)
+            
+            # Raw value (with commas for readability in tables)
+            if abs_val < 1000:
+                patterns.append(str(value))
+            
+            # In thousands (divide by 1,000)
+            if abs_val >= 1_000:
+                in_thousands = abs_val // 1_000
+                patterns.append(f"{in_thousands:,}")
+                patterns.append(str(in_thousands))
+            
+            # In millions (divide by 1,000,000)
+            if abs_val >= 1_000_000:
+                in_millions = abs_val // 1_000_000
+                patterns.append(f"{in_millions:,}")
+                patterns.append(str(in_millions))
+            
+            # In billions (divide by 1,000,000,000) 
+            if abs_val >= 1_000_000_000:
+                in_billions = abs_val / 1_000_000_000
+                patterns.append(f"{in_billions:.1f}")
+                patterns.append(f"{int(in_billions)}")
+    
+    # Remove duplicates
+    return list(set(p for p in patterns if p))
+
+
+def create_sliding_window_preprocessor(tokenizer):
+    """
+    Create a preprocessing function that:
+    1. Chunks long documents into MAX_LENGTH token windows with STRIDE overlap
+    2. Scans each chunk for source values from the answer JSON
+    3. Discards chunks that don't contain enough answer values (noise reduction)
+    
+    This is essential for training on GPUs with limited context (e.g., T4 with 2048 tokens).
+    """
+    
+    def preprocess_and_filter_chunks(examples):
+        """
+        Process batched examples with sliding window chunking.
+        Only keeps chunks that contain the answer values.
+        """
+        # Lists to hold filtered results
+        new_input_ids = []
+        new_attention_masks = []
+        new_labels = []
+        
+        texts = examples["text"]
+        answers = examples["answer"]
+        
+        for text, answer in zip(texts, answers):
+            # Extract searchable values from the answer JSON
+            search_patterns = extract_source_values(answer)
+            
+            if not search_patterns:
+                logger.warning("No searchable values found in answer, skipping")
+                continue
+            
+            # 1. Tokenize and chunk the text using sliding window
+            tokenized = tokenizer(
+                text,
+                truncation=True,
+                max_length=MAX_LENGTH,
+                stride=STRIDE,
+                return_overflowing_tokens=True,
+                return_offsets_mapping=True,
+                padding="max_length",
+                return_tensors=None  # Return lists, not tensors
+            )
+            
+            # Extract mappings and remove from tokenized dict
+            overflow_map = tokenized.pop("overflow_to_sample_mapping", None)
+            offset_mapping = tokenized.pop("offset_mapping", None)
+            
+            num_chunks = len(tokenized["input_ids"])
+            
+            # 2. Iterate through each chunk
+            for chunk_idx in range(num_chunks):
+                chunk_input_ids = tokenized["input_ids"][chunk_idx]
+                chunk_attention_mask = tokenized["attention_mask"][chunk_idx]
+                
+                # Decode chunk back to text to check for values
+                chunk_text = tokenizer.decode(chunk_input_ids, skip_special_tokens=True)
+                
+                # 3. CHECK: How many answer values are in this chunk?
+                matches = sum(1 for pattern in search_patterns if pattern in chunk_text)
+                match_ratio = matches / len(search_patterns)
+                
+                # Keep chunk if at least 30% of values are found
+                # (Financial values are spread across different tables/chunks)
+                if matches>=1:
+                    new_input_ids.append(chunk_input_ids)
+                    new_attention_masks.append(chunk_attention_mask)
+                    new_labels.append(chunk_input_ids.copy())  # For causal LM, labels = input_ids
+        
+        return {
+            "input_ids": new_input_ids,
+            "attention_mask": new_attention_masks,
+            "labels": new_labels
+        }
+    
+    return preprocess_and_filter_chunks
+
+
+def prepare_dataset_with_chunking(data_path: str, tokenizer) -> Dataset:
+    """
+    Load training data and prepare it with sliding window chunking.
+    
+    The data format is chat-style JSONL with messages array.
+    We extract the user content (document) and assistant content (answer),
+    then chunk and filter based on answer presence.
+    
+    Args:
+        data_path: Path to training JSONL file
+        tokenizer: Tokenizer for chunking
+        
+    Returns:
+        Filtered HuggingFace Dataset with only answer-containing chunks
+    """
+    logger.info(f"Loading and chunking training data from {data_path}...")
+    
+    # Load raw data
+    raw_data = [json.loads(line) for line in open(data_path) if line.strip()]
+    logger.info(f"Loaded {len(raw_data)} raw examples")
+    
+    # Extract text (full prompt) and answer for each example
+    prepared = []
+    for ex in raw_data:
+        messages = ex.get("messages", [])
+        
+        # Build formatted messages with /no_think
+        formatted_messages = []
+        answer = None
+        
+        for msg in messages:
+            if msg["role"] == "assistant":
+                answer = msg["content"]
+            content = msg["content"]
+            if msg["role"] == "user":
+                content += " /no_think"
+            formatted_messages.append({"role": msg["role"], "content": content})
+        
+        if not answer:
+            logger.warning(f"Skipping example without assistant response")
+            continue
+        
+        # Apply chat template for full text
+        text = tokenizer.apply_chat_template(
+            formatted_messages,
+            tokenize=False,
+            add_generation_prompt=False
+        )
+        
+        prepared.append({"text": text, "answer": answer})
+    
+    logger.info(f"Prepared {len(prepared)} examples for chunking")
+    
+    # Create dataset
+    dataset = Dataset.from_list(prepared)
+    
+    # Create preprocessor and apply chunking + filtering
+    preprocessor = create_sliding_window_preprocessor(tokenizer)
+    
+    chunked_dataset = dataset.map(
+        preprocessor,
+        batched=True,
+        remove_columns=dataset.column_names  # Remove old columns to avoid shape mismatch
+    )
+    
+    logger.info(f"Created {len(chunked_dataset)} training chunks (answer-containing only)")
+    
+    return chunked_dataset
 
 
 def create_custom_trainer(SFTTrainer, tokenizer):
@@ -174,22 +390,11 @@ def train(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load training data
-    logger.info(f"Loading training data from {data_path}...")
-    data = [json.loads(line) for line in open(data_path) if line.strip()]
-    formatted_data = []
-    for ex in data:
-        messages = [
-            {"role": m["role"], "content": m["content"] + " /no_think" if m["role"] == "user" else m["content"]}
-            for m in ex["messages"]
-        ]
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-        formatted_data.append({"text": text})
+    # Load and preprocess training data with sliding window chunking
+    # This chunks long documents and filters to only keep answer-containing chunks
+    dataset = prepare_dataset_with_chunking(data_path, tokenizer)
     
-    dataset = Dataset.from_list(formatted_data)
-    logger.info(f"Training dataset: {len(dataset)} examples")
-    
-    # Training config
+    # Training config - no dataset_text_field since data is pre-tokenized
     training_args = SFTConfig(
         output_dir=output_dir,
         per_device_train_batch_size=batch_size,
@@ -204,14 +409,13 @@ def train(
         weight_decay=0.01,
         lr_scheduler_type="linear",
         seed=42,
-        max_seq_length=max_seq_length,
+        max_seq_length=MAX_LENGTH,  # Match chunk size
         packing=False,
-        dataset_text_field="text",
     )
     
-    # Create custom trainer
+    # Create custom trainer with weighted loss
     CustomTrainer = create_custom_trainer(SFTTrainer, tokenizer)
-    trainer = SFTTrainer(
+    trainer = CustomTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
